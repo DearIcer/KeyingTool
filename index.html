@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>绿幕抠像与裁剪工具</title>
+  <title>绿幕抠像与裁剪工具（扩散图优化版）</title>
   <style>
     :root {
       --bg: #f4f6f8;
@@ -48,10 +48,11 @@
       color: #666;
       user-select: none;
     }
-    #dropZone:hover, #dropZone.drag-over {
+    #dropZone:hover, #dropZone.drag-over, #dropZone:focus-visible {
       border-color: var(--primary);
       color: var(--primary);
       background: rgba(24,160,88,.06);
+      outline: none;
     }
     #fileInput { display: none; }
 
@@ -103,8 +104,43 @@
       max-height: 55vh;
       display: block;
       margin: 0 auto;
+      border: none;
+      box-shadow: 0 0 0 1px var(--border);
+      border-radius: 6px;
+    }
+
+    .preview-viewport {
+      display: none;
+      position: relative;
+      width: 100%;
+      height: 55vh;
+      overflow: hidden;
+      background: #fff;
+      background-image:
+        linear-gradient(45deg, #e8e8e8 25%, transparent 25%),
+        linear-gradient(-45deg, #e8e8e8 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, #e8e8e8 75%),
+        linear-gradient(-45deg, transparent 75%, #e8e8e8 75%);
+      background-size: 20px 20px;
+      background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
       border: 1px solid var(--border);
       border-radius: 6px;
+      cursor: grab;
+      touch-action: none;
+    }
+    .preview-viewport.active { display: block; }
+    .preview-viewport:active { cursor: grabbing; }
+    .preview-viewport canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      transform-origin: 0 0;
+      max-width: none;
+      max-height: none;
+      border: none;
+      border-radius: 0;
+      margin: 0;
+      box-shadow: none;
     }
 
     .overlay {
@@ -282,14 +318,26 @@
       font-weight: normal;
     }
     .radio-row input { cursor: pointer; }
+
+    .noscript-tip {
+      background: #fff3cd;
+      color: #856404;
+      padding: 16px 24px;
+      text-align: center;
+      border-bottom: 1px solid #e0d0a0;
+    }
   </style>
 </head>
 <body>
+  <noscript>
+    <div class="noscript-tip">本工具需要启用 JavaScript 才能运行。请在浏览器设置中开启 JavaScript 后刷新页面。</div>
+  </noscript>
+
   <header>
     <h1>🎬 绿幕抠像与裁剪工具（扩散图优化版）</h1>
     <div class="upload-wrap">
-      <div id="dropZone">点击或拖拽上传图片</div>
-      <input type="file" id="fileInput" accept="image/*" />
+      <div id="dropZone" role="button" tabindex="0" aria-label="点击或拖拽上传图片">点击或拖拽上传图片</div>
+      <input type="file" id="fileInput" accept="image/*" aria-label="上传图片文件" />
     </div>
   </header>
 
@@ -300,7 +348,7 @@
           <h2>原图与裁剪区</h2>
           <div class="image-wrapper" id="sourceWrapper">
             <div class="empty-tip" id="emptyTip">请先上传一张绿幕图片</div>
-            <img id="sourceImg" style="display:none;" alt="source" />
+            <img id="sourceImg" style="display:none;" alt="上传的图片" />
             <div class="overlay" id="overlay" style="display:none;">
               <div class="crop-box" id="cropBox">
                 <div class="handle nw" data-handle="nw"></div>
@@ -317,11 +365,11 @@
         </div>
 
         <div class="panel">
-          <h2>抠像预览</h2>
-          <div class="image-wrapper">
-            <canvas id="previewCanvas" style="display:none;"></canvas>
-            <div class="empty-tip" id="previewEmpty">预览将显示在这里</div>
+          <h2>抠像预览（滚轮缩放 / 拖拽平移）</h2>
+          <div class="image-wrapper preview-viewport" id="previewViewport">
+            <canvas id="previewCanvas"></canvas>
           </div>
+          <div class="empty-tip" id="previewEmpty">预览将显示在这里</div>
         </div>
       </div>
 
@@ -329,7 +377,7 @@
         <h2>抠像参数</h2>
 
         <div class="control-group">
-          <label>抠像颜色</label>
+          <label for="keyColor">抠像颜色</label>
           <div class="color-row">
             <input type="color" id="keyColor" value="#00ff00" />
             <button class="btn secondary" id="sampleBtn">取样背景</button>
@@ -337,37 +385,61 @@
         </div>
 
         <div class="control-group">
-          <label>色相容差 <span class="tip-icon" data-tip="色相与取样背景色的允许偏差角度，越大越宽容">?</span> <span id="hueToleranceVal" class="value">30</span>°</label>
+          <button class="btn" id="animePresetBtn" style="width:100%;">应用二次元推荐参数</button>
+        </div>
+
+        <div class="control-group">
+          <label for="hueTolerance">色相容差 <span class="tip-icon" data-tip="色相与取样背景色的允许偏差角度，越大越宽容" tabindex="0">?</span> <span id="hueToleranceVal" class="value">30</span>°</label>
           <input type="range" id="hueTolerance" min="0" max="180" value="30" />
         </div>
 
         <div class="control-group">
-          <label>绿色浓度 <span class="tip-icon" data-tip="绿色通道领先红蓝通道的程度，用于识别绿色背景">?</span> <span id="greenThresholdVal" class="value">25</span></label>
+          <label for="greenThreshold">绿色浓度 <span class="tip-icon" data-tip="绿色通道领先红蓝通道的程度，用于识别绿色背景" tabindex="0">?</span> <span id="greenThresholdVal" class="value">25</span></label>
           <input type="range" id="greenThreshold" min="0" max="100" value="25" />
         </div>
 
         <div class="control-group">
-          <label>综合容差 <span class="tip-icon" data-tip="整体容差，越小保留的主体颜色越严格">?</span> <span id="toleranceVal" class="value">20</span></label>
+          <label for="tolerance">综合容差 <span class="tip-icon" data-tip="整体容差，越小保留的主体颜色越严格" tabindex="0">?</span> <span id="toleranceVal" class="value">20</span></label>
           <input type="range" id="tolerance" min="0" max="100" value="20" />
         </div>
 
         <div class="control-group">
-          <label>边缘羽化 <span class="tip-icon" data-tip="背景到前景的过渡宽度，越大边缘越柔和">?</span> <span id="featherVal" class="value">30</span></label>
+          <label for="feather">边缘羽化 <span class="tip-icon" data-tip="背景到前景的过渡宽度，越大边缘越柔和" tabindex="0">?</span> <span id="featherVal" class="value">30</span></label>
           <input type="range" id="feather" min="0" max="100" value="30" />
         </div>
 
         <div class="control-group">
-          <label>溢色抑制 <span class="tip-icon" data-tip="去除绿色溢出的强度，可减轻头发、衣服边缘的绿边">?</span> <span id="spillVal" class="value">80</span></label>
+          <label for="edgeBlur">边缘抗锯齿 <span class="tip-icon" data-tip="对 Alpha 通道做轻微高斯模糊，可减轻锯齿；过高会让边缘发虚" tabindex="0">?</span> <span id="edgeBlurVal" class="value">1</span></label>
+          <input type="range" id="edgeBlur" min="0" max="3" value="1" />
+        </div>
+
+        <div class="control-group">
+          <label for="strokeProtect">补充描边 <span class="tip-icon" data-tip="检测原图中比周围明显暗的线条并补回 alpha；0=关闭，适合修复被误抠的描边" tabindex="0">?</span> <span id="strokeProtectVal" class="value">0</span></label>
+          <input type="range" id="strokeProtect" min="0" max="100" value="0" />
+        </div>
+
+        <div class="control-group">
+          <label for="strokeColor">描边颜色 <span class="tip-icon" data-tip="补充描边时直接使用的颜色，建议选黑色或深灰色" tabindex="0">?</span></label>
+          <input type="color" id="strokeColor" value="#000000" />
+        </div>
+
+        <div class="control-group">
+          <label for="edgeFill">边缘填色 <span class="tip-icon" data-tip="用附近实心区域的颜色填充半透明边缘，可去除头发、衣服上的绿边；0=关闭" tabindex="0">?</span> <span id="edgeFillVal" class="value">0</span></label>
+          <input type="range" id="edgeFill" min="0" max="100" value="0" />
+        </div>
+
+        <div class="control-group">
+          <label for="spill">溢色抑制 <span class="tip-icon" data-tip="去除绿色溢出的强度，可减轻头发、衣服边缘的绿边" tabindex="0">?</span> <span id="spillVal" class="value">80</span></label>
           <input type="range" id="spill" min="0" max="100" value="80" />
         </div>
 
         <div class="control-group">
-          <label>去绿范围 <span class="tip-icon" data-tip="距离背景色多远仍会被当作绿边处理">?</span> <span id="spillRangeVal" class="value">40</span></label>
+          <label for="spillRange">去绿范围 <span class="tip-icon" data-tip="距离背景色多远仍会被当作绿边处理" tabindex="0">?</span> <span id="spillRangeVal" class="value">40</span></label>
           <input type="range" id="spillRange" min="0" max="100" value="40" />
         </div>
 
         <div class="control-group">
-          <label>去绿模式 <span class="tip-icon" data-tip="仅对半透明边缘去绿可保护主体颜色；全图去绿可清理实心绿边">?</span></label>
+          <label>去绿模式 <span class="tip-icon" data-tip="仅对半透明边缘去绿可保护主体颜色；全图去绿可清理实心绿边" tabindex="0">?</span></label>
           <div class="radio-row">
             <label><input type="radio" name="spillMode" value="edge" checked /> 仅半透明边缘</label>
             <label><input type="radio" name="spillMode" value="global" /> 全图去绿</label>
@@ -381,19 +453,19 @@
         <h2 style="margin-top:8px;">裁剪区域（像素）</h2>
         <div class="crop-inputs">
           <div class="control-group">
-            <label>X</label>
+            <label for="cropX">X</label>
             <input type="number" id="cropX" min="0" value="0" />
           </div>
           <div class="control-group">
-            <label>Y</label>
+            <label for="cropY">Y</label>
             <input type="number" id="cropY" min="0" value="0" />
           </div>
           <div class="control-group">
-            <label>宽</label>
+            <label for="cropW">宽</label>
             <input type="number" id="cropW" min="1" value="0" />
           </div>
           <div class="control-group">
-            <label>高</label>
+            <label for="cropH">高</label>
             <input type="number" id="cropH" min="1" value="0" />
           </div>
         </div>
@@ -408,6 +480,269 @@
   <canvas id="processedCanvas" style="display:none;"></canvas>
 
   <script>
+    // ---- Worker（在后台线程执行像素级抠像，避免 UI 卡死）----
+    const workerCode = `
+function parseHex(hex) {
+  const m = hex.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i);
+  if (!m) return [0, 255, 0];
+  return [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)];
+}
+function rgbToHsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === r) h = ((g - b) / d + 6) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+  }
+  const s = max === 0 ? 0 : d / max;
+  const v = max;
+  return [h, s, v];
+}
+function hueDiff(h1, h2) {
+  let d = Math.abs(h1 - h2);
+  return Math.min(d, 360 - d);
+}
+function blurAlpha(data, width, height, radius) {
+  if (radius <= 0) return;
+  const len = width * height;
+  const src = new Float32Array(len);
+  for (let i = 0; i < len; i++) src[i] = data[i * 4 + 3];
+  const temp = new Float32Array(len);
+  const size = radius * 2 + 1;
+  const kernel = new Float32Array(size);
+  const sigma = Math.max(0.5, radius / 2);
+  let sum = 0;
+  for (let i = 0; i < size; i++) {
+    const x = i - radius;
+    const v = Math.exp(-(x * x) / (2 * sigma * sigma));
+    kernel[i] = v;
+    sum += v;
+  }
+  for (let i = 0; i < size; i++) kernel[i] /= sum;
+  for (let y = 0; y < height; y++) {
+    const rowStart = y * width;
+    for (let x = 0; x < width; x++) {
+      let s = 0;
+      for (let k = -radius; k <= radius; k++) {
+        const px = Math.min(width - 1, Math.max(0, x + k));
+        s += src[rowStart + px] * kernel[k + radius];
+      }
+      temp[rowStart + x] = s;
+    }
+  }
+  for (let x = 0; x < width; x++) {
+    for (let y = 0; y < height; y++) {
+      let s = 0;
+      for (let k = -radius; k <= radius; k++) {
+        const py = Math.min(height - 1, Math.max(0, y + k));
+        s += temp[py * width + x] * kernel[k + radius];
+      }
+      src[y * width + x] = s;
+    }
+  }
+  for (let i = 0; i < len; i++) {
+    data[i * 4 + 3] = Math.max(0, Math.min(255, Math.round(src[i])));
+  }
+}
+function fillEdgeColor(data, width, height, strength) {
+  if (strength <= 0) return;
+  const radius = 2;
+  const threshold = 200;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4;
+      const a = data[idx + 3];
+      if (a <= 0 || a >= 255) continue;
+      let sr = 0, sg = 0, sb = 0, n = 0;
+      for (let dy = -radius; dy <= radius; dy++) {
+        for (let dx = -radius; dx <= radius; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const py = Math.min(height - 1, Math.max(0, y + dy));
+          const px = Math.min(width - 1, Math.max(0, x + dx));
+          const nidx = (py * width + px) * 4;
+          if (data[nidx + 3] >= threshold) {
+            sr += data[nidx];
+            sg += data[nidx + 1];
+            sb += data[nidx + 2];
+            n++;
+          }
+        }
+      }
+      if (n === 0) continue;
+      const t = strength / 100;
+      data[idx] = data[idx] * (1 - t) + (sr / n) * t;
+      data[idx + 1] = data[idx + 1] * (1 - t) + (sg / n) * t;
+      data[idx + 2] = data[idx + 2] * (1 - t) + (sb / n) * t;
+    }
+  }
+}
+function despill(r, g, b, tr, tg, tb, spillRange255, spillStrength, maxDist) {
+  if (spillStrength <= 0 || g <= Math.max(r, b)) return [r, g, b];
+  const dr = r - tr, dg = g - tg, db = b - tb;
+  const bgDist = Math.sqrt(dr * dr + dg * dg + db * db) / maxDist * 255;
+  if (spillRange255 <= 0 || bgDist >= spillRange255) return [r, g, b];
+  const spillFactor = (1 - bgDist / spillRange255) * spillStrength;
+  if (spillFactor <= 0) return [r, g, b];
+  const excess = g - Math.max(r, b);
+  const reduce = excess * spillFactor;
+  let nr = r + reduce * 0.5;
+  let ng = g - reduce;
+  let nb = b + reduce * 0.5;
+  const oldLum = 0.299 * r + 0.587 * g + 0.114 * b;
+  const newLum = 0.299 * nr + 0.587 * ng + 0.114 * nb;
+  if (newLum > 0) {
+    const scale = oldLum / newLum;
+    nr *= scale; ng *= scale; nb *= scale;
+  }
+  return [
+    Math.max(0, Math.min(255, nr)),
+    Math.max(0, Math.min(255, ng)),
+    Math.max(0, Math.min(255, nb))
+  ];
+}
+self.onmessage = function(e) {
+  const { imageData, params } = e.data;
+  const { data, width, height } = imageData;
+  const {
+    keyColor, hueTolerance, greenThreshold, tolerance, feather,
+    spillStrength, spillRange255, spillMode, edgeBlurRadius,
+    strokeProtectStrength, edgeFillStrength, strokeColor
+  } = params;
+
+  const [tr, tg, tb] = parseHex(keyColor);
+  const [targetH] = rgbToHsv(tr, tg, tb);
+  const greenThreshold255 = greenThreshold * 2.55;
+  const tol = tolerance / 100;
+  const fea = feather / 100;
+  const spillStr = spillStrength / 100;
+  const spillRng255 = spillRange255 * 2.55;
+  const strokeStr = strokeProtectStrength / 100;
+  const edgeFillStr = edgeFillStrength / 100;
+  const [strokeR, strokeG, strokeB] = parseHex(strokeColor);
+  const maxDist = Math.sqrt(255 * 255 * 3);
+
+  // 仅在需要描边保护时才拷贝原图数据
+  const originalData = strokeStr > 0 ? new Uint8ClampedArray(data) : null;
+
+  for (let i = 0; i < data.length; i += 4) {
+    let r = data[i];
+    let g = data[i + 1];
+    let b = data[i + 2];
+
+    const [h, s] = rgbToHsv(r, g, b);
+    const greenness = Math.max(0, g - Math.max(r, b));
+
+    let hueMatch = 1;
+    if (s > 0.08) {
+      const dh = hueDiff(h, targetH);
+      if (dh <= hueTolerance) hueMatch = 0;
+      else hueMatch = (dh - hueTolerance) / (180 - hueTolerance);
+    }
+
+    let greenMatch = 1;
+    if (greenThreshold255 > 0) {
+      if (greenness >= greenThreshold255) greenMatch = 0;
+      else greenMatch = 1 - greenness / greenThreshold255;
+    }
+
+    let match = Math.max(hueMatch, greenMatch);
+    match = Math.max(0, Math.min(1, match));
+
+    // 根据容差和羽化计算 alpha，确保纯前景永远不透明
+    const edgeEnd = Math.min(1, tol + fea);
+    let a = 255;
+    if (match <= tol) {
+      a = 0;
+    } else if (fea > 0 && match < edgeEnd) {
+      a = 255 * (match - tol) / (edgeEnd - tol);
+    }
+    a = Math.max(0, Math.min(255, a));
+
+    const isEdgePixel = a > 0 && a < 255;
+    if (spillMode === 'global') {
+      if (spillStr > 0 && g > Math.max(r, b)) {
+        [r, g, b] = despill(r, g, b, tr, tg, tb, spillRng255, spillStr, maxDist);
+      }
+    } else {
+      if (spillStr > 0 && isEdgePixel && g > Math.max(r, b)) {
+        [r, g, b] = despill(r, g, b, tr, tg, tb, spillRng255, spillStr, maxDist);
+      }
+    }
+
+    data[i] = r;
+    data[i + 1] = g;
+    data[i + 2] = b;
+    data[i + 3] = a;
+  }
+
+  // 补充描边：只在“前景-背景”边界上的暗色边缘补回描边
+  if (strokeStr > 0) {
+    const EDGE_THRESHOLD = 40;
+    const FG_THRESHOLD = 128;
+    const BG_THRESHOLD = 32;
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = (y * width + x) * 4;
+        if (data[idx + 3] >= FG_THRESHOLD) continue;
+        const lum = 0.299 * originalData[idx] + 0.587 * originalData[idx + 1] + 0.114 * originalData[idx + 2];
+        let maxNeighborLum = 0;
+        let hasFg = false;
+        let hasBg = false;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const py = Math.min(height - 1, Math.max(0, y + dy));
+            const px = Math.min(width - 1, Math.max(0, x + dx));
+            const nidx = (py * width + px) * 4;
+            const nlum = 0.299 * originalData[nidx] + 0.587 * originalData[nidx + 1] + 0.114 * originalData[nidx + 2];
+            if (nlum > maxNeighborLum) maxNeighborLum = nlum;
+            if (data[nidx + 3] > FG_THRESHOLD) hasFg = true;
+            if (data[nidx + 3] < BG_THRESHOLD) hasBg = true;
+          }
+        }
+        if (!hasFg || !hasBg) continue;
+        const diff = maxNeighborLum - lum;
+        if (diff > EDGE_THRESHOLD) {
+          const score = Math.min(1, (diff - EDGE_THRESHOLD) / 40);
+          const boost = strokeStr * 255 * score;
+          data[idx] = strokeR;
+          data[idx + 1] = strokeG;
+          data[idx + 2] = strokeB;
+          data[idx + 3] = Math.max(data[idx + 3], boost);
+        }
+      }
+    }
+  }
+
+  // 对补充描边补回的像素再做一次去绿，防止出现绿色描边；同时尊重去绿模式
+  if (spillStr > 0) {
+    for (let i = 0; i < data.length; i += 4) {
+      if (data[i + 3] > 0 && data[i + 1] > Math.max(data[i], data[i + 2])) {
+        const isEdgePixel = data[i + 3] < 255;
+        if (spillMode === 'global' || isEdgePixel) {
+          const [nr, ng, nb] = despill(data[i], data[i + 1], data[i + 2], tr, tg, tb, spillRng255, spillStr, maxDist);
+          data[i] = nr; data[i + 1] = ng; data[i + 2] = nb;
+        }
+      }
+    }
+  }
+
+  if (edgeFillStr > 0) {
+    fillEdgeColor(data, width, height, edgeFillStr * 100);
+  }
+  if (edgeBlurRadius > 0) {
+    blurAlpha(data, width, height, edgeBlurRadius);
+  }
+
+  self.postMessage({ imageData }, [imageData.data.buffer]);
+};
+`;
+
     // ---- DOM ----
     const fileInput = document.getElementById('fileInput');
     const dropZone = document.getElementById('dropZone');
@@ -418,12 +753,14 @@
     const cropBox = document.getElementById('cropBox');
     const sourceWrapper = document.getElementById('sourceWrapper');
     const previewCanvas = document.getElementById('previewCanvas');
+    const previewViewport = document.getElementById('previewViewport');
     const originalCanvas = document.getElementById('originalCanvas');
     const processedCanvas = document.getElementById('processedCanvas');
     const exportBtn = document.getElementById('exportBtn');
 
     const keyColorInput = document.getElementById('keyColor');
     const sampleBtn = document.getElementById('sampleBtn');
+    const animePresetBtn = document.getElementById('animePresetBtn');
     const hueToleranceInput = document.getElementById('hueTolerance');
     const greenThresholdInput = document.getElementById('greenThreshold');
     const toleranceInput = document.getElementById('tolerance');
@@ -431,12 +768,19 @@
     const spillInput = document.getElementById('spill');
     const spillRangeInput = document.getElementById('spillRange');
     const spillModeInputs = document.querySelectorAll('input[name="spillMode"]');
+    const edgeBlurInput = document.getElementById('edgeBlur');
+    const strokeProtectInput = document.getElementById('strokeProtect');
+    const strokeColorInput = document.getElementById('strokeColor');
+    const edgeFillInput = document.getElementById('edgeFill');
     const hueToleranceVal = document.getElementById('hueToleranceVal');
     const greenThresholdVal = document.getElementById('greenThresholdVal');
     const toleranceVal = document.getElementById('toleranceVal');
     const featherVal = document.getElementById('featherVal');
     const spillVal = document.getElementById('spillVal');
     const spillRangeVal = document.getElementById('spillRangeVal');
+    const edgeBlurVal = document.getElementById('edgeBlurVal');
+    const strokeProtectVal = document.getElementById('strokeProtectVal');
+    const edgeFillVal = document.getElementById('edgeFillVal');
     const cropXInput = document.getElementById('cropX');
     const cropYInput = document.getElementById('cropY');
     const cropWInput = document.getElementById('cropW');
@@ -444,6 +788,7 @@
 
     // ---- State ----
     let originalImage = null;
+    let currentFileName = null;
     let imgWidth = 0;
     let imgHeight = 0;
     let crop = { x: 0, y: 0, w: 0, h: 0 };
@@ -453,6 +798,89 @@
     let startPointer = { x: 0, y: 0 };
     let startCropDisplay = { x: 0, y: 0, w: 0, h: 0 };
     let scheduledProcess = false;
+    let previewViewportSize = { w: 0, h: 0 };
+    let previewView = { baseScale: 1, zoom: 1, offsetX: 0, offsetY: 0, isPanning: false, panStartX: 0, panStartY: 0, panStartOffsetX: 0, panStartOffsetY: 0 };
+
+    // ---- Worker management ----
+    let worker = null;
+    let isWorkerProcessing = false;
+    let pendingProcessParams = null;
+
+    function initWorker() {
+      if (worker) return;
+      try {
+        const blob = new Blob([workerCode], { type: 'application/javascript' });
+        const url = URL.createObjectURL(blob);
+        worker = new Worker(url);
+        worker.onmessage = (e) => {
+          const { imageData } = e.data;
+          processedCanvas.getContext('2d').putImageData(imageData, 0, 0);
+          isWorkerProcessing = false;
+          updatePreview();
+          if (pendingProcessParams) {
+            const params = pendingProcessParams;
+            pendingProcessParams = null;
+            processWithParams(params);
+          }
+        };
+        worker.onerror = (err) => {
+          console.error(err);
+          isWorkerProcessing = false;
+          pendingProcessParams = null;
+          alert('抠像处理时发生错误，请尝试降低图片分辨率或刷新页面。');
+        };
+      } catch (err) {
+        console.error('Worker init failed', err);
+        worker = null;
+      }
+    }
+
+    function gatherProcessParams() {
+      return {
+        keyColor: keyColorInput.value,
+        hueTolerance: parseFloat(hueToleranceInput.value),
+        greenThreshold: parseFloat(greenThresholdInput.value),
+        tolerance: parseFloat(toleranceInput.value),
+        feather: parseFloat(featherInput.value),
+        spillStrength: parseFloat(spillInput.value),
+        spillRange255: parseFloat(spillRangeInput.value),
+        spillMode: document.querySelector('input[name="spillMode"]:checked').value,
+        edgeBlurRadius: parseInt(edgeBlurInput.value, 10),
+        strokeProtectStrength: parseFloat(strokeProtectInput.value),
+        edgeFillStrength: parseFloat(edgeFillInput.value),
+        strokeColor: strokeColorInput.value
+      };
+    }
+
+    function processWithParams(params) {
+      if (!originalImage || !worker) return;
+      isWorkerProcessing = true;
+      const srcCtx = originalCanvas.getContext('2d');
+      const imageData = srcCtx.getImageData(0, 0, imgWidth, imgHeight);
+      worker.postMessage({ imageData, params }, [imageData.data.buffer]);
+    }
+
+    // 当浏览器不支持 Worker（如部分 file:// 环境）时的同步降级处理
+    function processImageFallback(params) {
+      if (!originalImage) return;
+      try {
+        const srcCtx = originalCanvas.getContext('2d');
+        const imageData = srcCtx.getImageData(0, 0, imgWidth, imgHeight);
+        const mockSelf = {
+          onmessage: null,
+          postMessage: function(msg) {
+            processedCanvas.getContext('2d').putImageData(msg.imageData, 0, 0);
+            updatePreview();
+          }
+        };
+        const runWorker = new Function('self', workerCode);
+        runWorker(mockSelf);
+        mockSelf.onmessage({ data: { imageData, params } });
+      } catch (err) {
+        console.error(err);
+        alert('抠像处理失败：' + (err.message || '未知错误'));
+      }
+    }
 
     // ---- Helpers ----
     function parseHex(hex) {
@@ -463,28 +891,6 @@
 
     function rgbToHex(r, g, b) {
       return '#' + [r, g, b].map(v => Math.max(0, Math.min(255, v)).toString(16).padStart(2, '0')).join('');
-    }
-
-    function rgbToHsv(r, g, b) {
-      r /= 255; g /= 255; b /= 255;
-      const max = Math.max(r, g, b);
-      const min = Math.min(r, g, b);
-      const d = max - min;
-      let h = 0;
-      if (d !== 0) {
-        if (max === r) h = ((g - b) / d + 6) % 6;
-        else if (max === g) h = (b - r) / d + 2;
-        else h = (r - g) / d + 4;
-        h *= 60;
-      }
-      const s = max === 0 ? 0 : d / max;
-      const v = max;
-      return [h, s, v];
-    }
-
-    function hueDiff(h1, h2) {
-      let d = Math.abs(h1 - h2);
-      return Math.min(d, 360 - d);
     }
 
     function resetCrop() {
@@ -535,153 +941,155 @@
       scheduledProcess = true;
       requestAnimationFrame(() => {
         scheduledProcess = false;
-        processImage();
+        try {
+          processImage();
+        } catch (err) {
+          console.error(err);
+          alert('处理参数时出错：' + (err.message || '未知错误'));
+        }
       });
     }
 
     function processImage() {
       if (!originalImage) return;
-      const srcCtx = originalCanvas.getContext('2d');
-      const dstCtx = processedCanvas.getContext('2d');
-      const imageData = srcCtx.getImageData(0, 0, imgWidth, imgHeight);
-      const data = imageData.data;
-
-      const [tr, tg, tb] = parseHex(keyColorInput.value);
-      const [targetH] = rgbToHsv(tr, tg, tb);
-      const hueTolerance = parseFloat(hueToleranceInput.value);
-      const greenThreshold255 = parseFloat(greenThresholdInput.value) * 2.55; // 0-255
-      const tolerance = parseFloat(toleranceInput.value) / 100;
-      const feather = parseFloat(featherInput.value) / 100;
-      const spillStrength = parseFloat(spillInput.value) / 100;
-      const spillRange255 = parseFloat(spillRangeInput.value) * 2.55; // 映射到 0-255
-      const spillMode = document.querySelector('input[name="spillMode"]:checked').value;
-      const maxDist = Math.sqrt(255 * 255 * 3);
-
-      for (let i = 0; i < data.length; i += 4) {
-        let r = data[i];
-        let g = data[i + 1];
-        let b = data[i + 2];
-
-        const [h, s] = rgbToHsv(r, g, b);
-        const greenness = Math.max(0, g - Math.max(r, b));
-
-        // 色相匹配：低饱和度像素色相不可靠，倾向于保留（交给绿色浓度判断）
-        let hueMatch = 1;
-        if (s > 0.08) {
-          const dh = hueDiff(h, targetH);
-          if (dh <= hueTolerance) hueMatch = 0;
-          else hueMatch = (dh - hueTolerance) / (180 - hueTolerance);
-        }
-
-        // 绿色通道优势：g 明显大于 r/b 时更像背景
-        let greenMatch = 1;
-        if (greenThreshold255 > 0) {
-          if (greenness >= greenThreshold255) greenMatch = 0;
-          else greenMatch = 1 - greenness / greenThreshold255;
-        }
-
-        // 综合匹配度：0 = 背景，1 = 前景
-        let match = Math.max(hueMatch, greenMatch);
-        match = Math.max(0, Math.min(1, match));
-
-        // 根据容差和羽化计算 alpha
-        let a = 255;
-        if (match <= tolerance) {
-          a = 0;
-        } else if (feather > 0 && match < tolerance + feather) {
-          a = 255 * (match - tolerance) / feather;
-        }
-        a = Math.max(0, Math.min(255, a));
-
-        // 溢色抑制 / 去绿边：根据与背景色的距离做颜色去污染
-        const maxRB = Math.max(r, b);
-        const isEdgePixel = a > 0 && a < 255;
-        const shouldDespill = spillMode === 'global'
-          ? (spillStrength > 0 && g > maxRB)
-          : (spillStrength > 0 && isEdgePixel && g > maxRB);
-        if (shouldDespill) {
-          const dr = r - tr, dg = g - tg, db = b - tb;
-          const bgDist = Math.sqrt(dr * dr + dg * dg + db * db) / maxDist * 255;
-          const spillFactor = Math.max(0, 1 - bgDist / spillRange255) * spillStrength;
-          if (spillFactor > 0) {
-            const excess = g - maxRB;
-            const reduce = excess * spillFactor;
-            g -= reduce;
-            // 补色：向洋红/红色方向偏移，抵消绿色残留
-            const comp = reduce * 0.5;
-            r = Math.min(255, r + comp);
-            b = Math.min(255, b + comp);
-          }
-        }
-
-        data[i] = r;
-        data[i + 1] = g;
-        data[i + 2] = b;
-        data[i + 3] = a;
+      initWorker();
+      if (!worker) {
+        // Worker 不可用（常见于某些 file:// 环境），降级到同步处理
+        processImageFallback(gatherProcessParams());
+        return;
       }
+      if (isWorkerProcessing) {
+        pendingProcessParams = gatherProcessParams();
+        return;
+      }
+      processWithParams(gatherProcessParams());
+    }
 
-      dstCtx.putImageData(imageData, 0, 0);
-      updatePreview();
+    function updatePreviewViewportSize() {
+      const rect = previewViewport.getBoundingClientRect();
+      previewViewportSize = { w: rect.width, h: rect.height };
+    }
+
+    function clampPreviewOffset() {
+      const { w, h } = previewViewportSize;
+      const s = previewView.baseScale * previewView.zoom;
+      const minX = Math.min(0, w - imgWidth * s);
+      const maxX = Math.max(0, w - imgWidth * s);
+      const minY = Math.min(0, h - imgHeight * s);
+      const maxY = Math.max(0, h - imgHeight * s);
+      previewView.offsetX = Math.max(minX, Math.min(maxX, previewView.offsetX));
+      previewView.offsetY = Math.max(minY, Math.min(maxY, previewView.offsetY));
+    }
+
+    function applyPreviewTransform() {
+      const s = previewView.baseScale * previewView.zoom;
+      previewCanvas.style.transform = `translate(${previewView.offsetX}px, ${previewView.offsetY}px) scale(${s})`;
+    }
+
+    function fitPreview() {
+      if (!originalImage) return;
+      const { w, h } = previewViewportSize;
+      if (w <= 0 || h <= 0) return;
+      previewView.baseScale = Math.min(w / imgWidth, h / imgHeight, 1);
+      previewView.zoom = 1;
+      previewView.offsetX = (w - imgWidth * previewView.baseScale) / 2;
+      previewView.offsetY = (h - imgHeight * previewView.baseScale) / 2;
+      applyPreviewTransform();
     }
 
     function updatePreview() {
       if (!originalImage) return;
-      const rect = previewCanvas.parentElement.getBoundingClientRect();
-      const wrapperW = rect.width - 2;
-      const wrapperH = window.innerHeight * 0.55;
-      const scale = Math.min(wrapperW / imgWidth, wrapperH / imgHeight, 1);
-      const w = Math.floor(imgWidth * scale);
-      const h = Math.floor(imgHeight * scale);
-      previewCanvas.width = w;
-      previewCanvas.height = h;
-      previewCanvas.style.display = 'block';
+      if (previewCanvas.width !== imgWidth) previewCanvas.width = imgWidth;
+      if (previewCanvas.height !== imgHeight) previewCanvas.height = imgHeight;
       previewEmpty.style.display = 'none';
+      previewViewport.classList.add('active');
 
       const ctx = previewCanvas.getContext('2d');
-      ctx.clearRect(0, 0, w, h);
-      ctx.drawImage(processedCanvas, 0, 0, w, h);
+      ctx.clearRect(0, 0, imgWidth, imgHeight);
+      ctx.drawImage(processedCanvas, 0, 0);
 
       ctx.strokeStyle = '#00ffcc';
-      ctx.lineWidth = 2;
-      ctx.setLineDash([6, 4]);
-      ctx.strokeRect(crop.x * scale, crop.y * scale, crop.w * scale, crop.h * scale);
+      ctx.lineWidth = Math.max(1, Math.round(Math.min(imgWidth, imgHeight) / 400));
+      ctx.setLineDash([Math.max(4, Math.round(imgWidth / 200)), Math.max(3, Math.round(imgWidth / 300))]);
+      ctx.strokeRect(crop.x, crop.y, crop.w, crop.h);
       ctx.setLineDash([]);
+
+      applyPreviewTransform();
     }
 
     function loadImage(file) {
-      if (!file || !file.type.startsWith('image/')) return;
+      if (!file || !file.type.startsWith('image/')) {
+        alert('请选择图片文件。');
+        return;
+      }
+      currentFileName = file.name;
       const reader = new FileReader();
+      reader.onerror = () => alert('读取文件失败，请重试。');
       reader.onload = (e) => {
         const url = e.target.result;
         const img = new Image();
+        img.onerror = () => alert('图片加载失败，请检查文件格式。');
         img.onload = () => {
-          originalImage = img;
-          imgWidth = img.width;
-          imgHeight = img.height;
+          try {
+            originalImage = img;
+            imgWidth = img.width;
+            imgHeight = img.height;
 
-          originalCanvas.width = imgWidth;
-          originalCanvas.height = imgHeight;
-          originalCanvas.getContext('2d').drawImage(img, 0, 0);
+            originalCanvas.width = imgWidth;
+            originalCanvas.height = imgHeight;
+            originalCanvas.getContext('2d').drawImage(img, 0, 0);
 
-          processedCanvas.width = imgWidth;
-          processedCanvas.height = imgHeight;
+            processedCanvas.width = imgWidth;
+            processedCanvas.height = imgHeight;
 
-          resetCrop();
-          emptyTip.style.display = 'none';
-          sourceImg.style.display = 'block';
-          overlay.style.display = 'block';
-          sourceImg.src = url;
-          exportBtn.disabled = false;
+            resetCrop();
+            emptyTip.style.display = 'none';
+            sourceImg.style.display = 'block';
+            overlay.style.display = 'block';
+            exportBtn.disabled = false;
 
-          sourceImg.onload = () => {
-            updateCropOverlay();
-            updatePreview();
-          };
-          processImage();
+            // 先绑定 onload 再设置 src，避免缓存导致回调丢失
+            sourceImg.onload = () => {
+              previewEmpty.style.display = 'none';
+              previewViewport.classList.add('active');
+              updatePreviewViewportSize();
+              updateCropOverlay();
+              fitPreview();
+            };
+            sourceImg.src = url;
+
+            processImage();
+          } catch (err) {
+            console.error(err);
+            alert('加载图片失败：' + (err.message || '可能是图片过大或格式不受支持。'));
+          }
         };
         img.src = url;
       };
       reader.readAsDataURL(file);
+    }
+
+    function applyAnimePreset() {
+      keyColorInput.value = '#00ff00';
+      hueToleranceInput.value = 35;
+      greenThresholdInput.value = 30;
+      toleranceInput.value = 15;
+      featherInput.value = 12;
+      spillInput.value = 90;
+      spillRangeInput.value = 55;
+      edgeBlurInput.value = 0;
+      strokeProtectInput.value = 0;
+      edgeFillInput.value = 65;
+      hueToleranceVal.textContent = 35;
+      greenThresholdVal.textContent = 30;
+      toleranceVal.textContent = 15;
+      featherVal.textContent = 12;
+      spillVal.textContent = 90;
+      spillRangeVal.textContent = 55;
+      edgeBlurVal.textContent = 0;
+      strokeProtectVal.textContent = 0;
+      edgeFillVal.textContent = 65;
+      scheduleProcess();
     }
 
     function sampleBackground(e) {
@@ -734,22 +1142,34 @@
 
     function exportPNG() {
       if (!originalImage || crop.w <= 0 || crop.h <= 0) return;
-      const canvas = document.createElement('canvas');
-      canvas.width = crop.w;
-      canvas.height = crop.h;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(processedCanvas, crop.x, crop.y, crop.w, crop.h, 0, 0, crop.w, crop.h);
-      const url = canvas.toDataURL('image/png');
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'green-screen-cropped.png';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = crop.w;
+        canvas.height = crop.h;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(processedCanvas, crop.x, crop.y, crop.w, crop.h, 0, 0, crop.w, crop.h);
+        const url = canvas.toDataURL('image/png');
+        const a = document.createElement('a');
+        a.href = url;
+        const base = currentFileName ? currentFileName.replace(/\.[^.]+$/, '') : 'green-screen';
+        a.download = base + '-cropped.png';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      } catch (err) {
+        console.error(err);
+        alert('导出失败：' + (err.message || '可能是图片过大。'));
+      }
     }
 
     // ---- Upload ----
     dropZone.addEventListener('click', () => fileInput.click());
+    dropZone.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        fileInput.click();
+      }
+    });
     fileInput.addEventListener('change', (e) => loadImage(e.target.files[0]));
     dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); });
     dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
@@ -761,10 +1181,10 @@
 
     // ---- Controls ----
     sampleBtn.addEventListener('click', () => togglePicking());
+    animePresetBtn.addEventListener('click', applyAnimePreset);
     sourceWrapper.addEventListener('click', (e) => {
       if (isPicking) sampleBackground(e);
     });
-    // 点击裁剪框时不触发取样
     cropBox.addEventListener('click', (e) => e.stopPropagation());
 
     keyColorInput.addEventListener('input', scheduleProcess);
@@ -796,6 +1216,19 @@
     spillModeInputs.forEach(radio => {
       radio.addEventListener('change', scheduleProcess);
     });
+    edgeBlurInput.addEventListener('input', () => {
+      edgeBlurVal.textContent = edgeBlurInput.value;
+      scheduleProcess();
+    });
+    strokeProtectInput.addEventListener('input', () => {
+      strokeProtectVal.textContent = strokeProtectInput.value;
+      scheduleProcess();
+    });
+    strokeColorInput.addEventListener('input', scheduleProcess);
+    edgeFillInput.addEventListener('input', () => {
+      edgeFillVal.textContent = edgeFillInput.value;
+      scheduleProcess();
+    });
 
     [cropXInput, cropYInput, cropWInput, cropHInput].forEach(input => {
       input.addEventListener('input', updateCropFromInputs);
@@ -805,8 +1238,54 @@
 
     window.addEventListener('resize', () => {
       if (!originalImage) return;
+      updatePreviewViewportSize();
       updateCropOverlay();
       updatePreview();
+      fitPreview();
+    });
+
+    // ---- Preview zoom & pan ----
+    previewViewport.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const rect = previewViewport.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const factor = e.deltaY < 0 ? 1.1 : 0.9;
+      const newZoom = Math.max(0.5, Math.min(8, previewView.zoom * factor));
+
+      const oldS = previewView.baseScale * previewView.zoom;
+      const newS = previewView.baseScale * newZoom;
+      previewView.offsetX = mx - (mx - previewView.offsetX) * (newS / oldS);
+      previewView.offsetY = my - (my - previewView.offsetY) * (newS / oldS);
+      previewView.zoom = newZoom;
+      clampPreviewOffset();
+      applyPreviewTransform();
+    }, { passive: false });
+
+    previewViewport.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      previewView.isPanning = true;
+      previewView.panStartX = e.clientX;
+      previewView.panStartY = e.clientY;
+      previewView.panStartOffsetX = previewView.offsetX;
+      previewView.panStartOffsetY = previewView.offsetY;
+      previewViewport.setPointerCapture(e.pointerId);
+    });
+    previewViewport.addEventListener('pointermove', (e) => {
+      if (!previewView.isPanning) return;
+      const dx = e.clientX - previewView.panStartX;
+      const dy = e.clientY - previewView.panStartY;
+      previewView.offsetX = previewView.panStartOffsetX + dx;
+      previewView.offsetY = previewView.panStartOffsetY + dy;
+      clampPreviewOffset();
+      applyPreviewTransform();
+    });
+    previewViewport.addEventListener('pointerup', (e) => {
+      previewView.isPanning = false;
+      previewViewport.releasePointerCapture(e.pointerId);
+    });
+    previewViewport.addEventListener('pointercancel', () => {
+      previewView.isPanning = false;
     });
 
     // ---- Crop dragging ----
