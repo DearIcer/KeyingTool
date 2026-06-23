@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>绿幕抠像与裁剪工具（扩散图优化版）</title>
+  <title>绿幕抠像与裁剪工具（扩散图 / 复杂边缘优化版）</title>
   <style>
     :root {
       --bg: #f4f6f8;
@@ -90,8 +90,10 @@
 
     .image-wrapper {
       position: relative;
-      display: inline-block;
-      width: 100%;
+      display: block;
+      width: fit-content;
+      max-width: 100%;
+      margin: 0 auto;
       line-height: 0;
       text-align: center;
     }
@@ -304,20 +306,21 @@
       visibility: visible;
     }
 
-    .radio-row {
+    .radio-row, .checkbox-row {
       display: flex;
       gap: 16px;
       font-size: 13px;
       color: #555;
     }
-    .radio-row label {
+    .radio-row label, .checkbox-row label {
       display: flex;
       align-items: center;
       gap: 4px;
       cursor: pointer;
       font-weight: normal;
+      justify-content: flex-start;
     }
-    .radio-row input { cursor: pointer; }
+    .radio-row input, .checkbox-row input { cursor: pointer; }
 
     .noscript-tip {
       background: #fff3cd;
@@ -334,7 +337,7 @@
   </noscript>
 
   <header>
-    <h1>🎬 绿幕抠像与裁剪工具（扩散图优化版）</h1>
+    <h1>🎬 绿幕抠像与裁剪工具（扩散图 / 复杂边缘优化版）</h1>
     <div class="upload-wrap">
       <div id="dropZone" role="button" tabindex="0" aria-label="点击或拖拽上传图片">点击或拖拽上传图片</div>
       <input type="file" id="fileInput" accept="image/*" aria-label="上传图片文件" />
@@ -424,7 +427,7 @@
         </div>
 
         <div class="control-group">
-          <label for="edgeFill">边缘填色 <span class="tip-icon" data-tip="用附近实心区域的颜色填充半透明边缘，可去除头发、衣服上的绿边；0=关闭" tabindex="0">?</span> <span id="edgeFillVal" class="value">0</span></label>
+          <label for="edgeFill">边缘填色 <span class="tip-icon" data-tip="用附近非绿实色前景替换边缘（包括半透明和紧贴背景的实色绿边）的颜色，对扩散图头发/蕾丝绿边效果更稳；0=关闭" tabindex="0">?</span> <span id="edgeFillVal" class="value">0</span></label>
           <input type="range" id="edgeFill" min="0" max="100" value="0" />
         </div>
 
@@ -446,8 +449,23 @@
           </div>
         </div>
 
+        <div class="control-group">
+          <div class="checkbox-row">
+            <label>
+              <input type="checkbox" id="localDespill" checked />
+              局部背景去绿
+              <span class="tip-icon" data-tip="根据每个边缘像素附近的实际背景色去绿，对扩散图不均匀绿幕和头发/蕾丝等复杂边缘效果更好" tabindex="0">?</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="control-group">
+          <label for="fringeClean">边缘清绿 <span class="tip-icon" data-tip="用附近实色前景替换半透明边缘的残余绿色，适合处理头发、蕾丝等复杂边角" tabindex="0">?</span> <span id="fringeCleanVal" class="value">40</span></label>
+          <input type="range" id="fringeClean" min="0" max="100" value="40" />
+        </div>
+
         <p class="hint">
-          提示：扩散生成图的背景往往不均匀，建议点击“取样背景”在原图绿色区域取色，再微调“色相容差”和“绿色浓度”。如果头发边缘还有绿边，提高“溢色抑制”和“去绿范围”，或切换到“全图去绿”。
+          提示：扩散生成图的背景往往不均匀，建议点击“取样背景”在原图绿色区域取色。新版策略以“边缘填色”为主：不强行去绿，而是用附近非绿实色前景覆盖绿边，对头发、蕾丝等复杂边角更稳。若仍有绿边，优先调高“边缘填色”，再视情况补一点“边缘清绿”。
         </p>
 
         <h2 style="margin-top:8px;">裁剪区域（像素）</h2>
@@ -507,6 +525,11 @@ function hueDiff(h1, h2) {
   let d = Math.abs(h1 - h2);
   return Math.min(d, 360 - d);
 }
+function smoothstep(edge0, edge1, x) {
+  if (edge0 >= edge1) return x >= edge1 ? 1 : 0;
+  const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
 function blurAlpha(data, width, height, radius) {
   if (radius <= 0) return;
   const len = width * height;
@@ -551,33 +574,71 @@ function blurAlpha(data, width, height, radius) {
 }
 function fillEdgeColor(data, width, height, strength) {
   if (strength <= 0) return;
-  const radius = 2;
-  const threshold = 200;
+  const radius = 5;
+  const solidThreshold = 200;
+  const bgThreshold = 30;
+  const bgNeighborRadius = 2;
+
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const idx = (y * width + x) * 4;
       const a = data[idx + 3];
-      if (a <= 0 || a >= 255) continue;
-      let sr = 0, sg = 0, sb = 0, n = 0;
+      if (a <= 0) continue;
+
+      const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+      const greenness = g - Math.max(r, b);
+
+      // 判断是否在边缘：有背景邻居，或本身是半透明
+      let hasBgNeighbor = false;
+      for (let dy = -bgNeighborRadius; dy <= bgNeighborRadius && !hasBgNeighbor; dy++) {
+        for (let dx = -bgNeighborRadius; dx <= bgNeighborRadius && !hasBgNeighbor; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const py = Math.min(height - 1, Math.max(0, y + dy));
+          const px = Math.min(width - 1, Math.max(0, x + dx));
+          const nidx = (py * width + px) * 4;
+          if (data[nidx + 3] <= bgThreshold) hasBgNeighbor = true;
+        }
+      }
+      const isSemiTransparent = a > 0 && a < 245;
+      if (!hasBgNeighbor && !isSemiTransparent) continue;
+
+      // 在更大范围内收集实色前景，按距离和非绿程度加权
+      let sr = 0, sg = 0, sb = 0, totalWeight = 0;
       for (let dy = -radius; dy <= radius; dy++) {
         for (let dx = -radius; dx <= radius; dx++) {
           if (dx === 0 && dy === 0) continue;
           const py = Math.min(height - 1, Math.max(0, y + dy));
           const px = Math.min(width - 1, Math.max(0, x + dx));
           const nidx = (py * width + px) * 4;
-          if (data[nidx + 3] >= threshold) {
-            sr += data[nidx];
-            sg += data[nidx + 1];
-            sb += data[nidx + 2];
-            n++;
+          if (data[nidx + 3] < solidThreshold) continue;
+
+          const wr = data[nidx], wg = data[nidx + 1], wb = data[nidx + 2];
+          const neighborGreenness = Math.max(0, wg - Math.max(wr, wb));
+          const dist = Math.sqrt(dx * dx + dy * dy);
+
+          let w = 1 / (dist + 1);
+          if (neighborGreenness > 20) {
+            w *= Math.max(0.1, 1 - neighborGreenness / 80);
           }
+
+          sr += wr * w;
+          sg += wg * w;
+          sb += wb * w;
+          totalWeight += w;
         }
       }
-      if (n === 0) continue;
-      const t = strength / 100;
-      data[idx] = data[idx] * (1 - t) + (sr / n) * t;
-      data[idx + 1] = data[idx + 1] * (1 - t) + (sg / n) * t;
-      data[idx + 2] = data[idx + 2] * (1 - t) + (sb / n) * t;
+      if (totalWeight === 0) continue;
+
+      // 越绿、越靠边缘，回填越积极；非绿边缘只轻微平滑
+      let t = strength / 100;
+      if (hasBgNeighbor) {
+        t *= 0.15 + 0.85 * Math.min(1, greenness / 30);
+      }
+      t = Math.max(0, Math.min(1, t));
+
+      data[idx] = r * (1 - t) + (sr / totalWeight) * t;
+      data[idx + 1] = g * (1 - t) + (sg / totalWeight) * t;
+      data[idx + 2] = b * (1 - t) + (sb / totalWeight) * t;
     }
   }
 }
@@ -590,9 +651,16 @@ function despill(r, g, b, tr, tg, tb, spillRange255, spillStrength, maxDist) {
   if (spillFactor <= 0) return [r, g, b];
   const excess = g - Math.max(r, b);
   const reduce = excess * spillFactor;
-  let nr = r + reduce * 0.5;
+  const rbSum = r + b;
+  let nr, nb;
+  if (rbSum > 0) {
+    nr = r + reduce * (r / rbSum);
+    nb = b + reduce * (b / rbSum);
+  } else {
+    nr = r + reduce * 0.5;
+    nb = b + reduce * 0.5;
+  }
   let ng = g - reduce;
-  let nb = b + reduce * 0.5;
   const oldLum = 0.299 * r + 0.587 * g + 0.114 * b;
   const newLum = 0.299 * nr + 0.587 * ng + 0.114 * nb;
   if (newLum > 0) {
@@ -605,13 +673,73 @@ function despill(r, g, b, tr, tg, tb, spillRange255, spillStrength, maxDist) {
     Math.max(0, Math.min(255, nb))
   ];
 }
+function estimateLocalBackground(data, originalData, bgLikelihood, width, height, x, y, radius, bgThreshold) {
+  let sr = 0, sg = 0, sb = 0, totalWeight = 0;
+  for (let dy = -radius; dy <= radius; dy++) {
+    for (let dx = -radius; dx <= radius; dx++) {
+      const px = Math.min(width - 1, Math.max(0, x + dx));
+      const py = Math.min(height - 1, Math.max(0, y + dy));
+      const idx = (py * width + px) * 4;
+      const ni = py * width + px;
+      // 用最终 alpha 或初始背景似然共同判断： thick fringe 区域 alpha 可能被误分为前景
+      let w = 0;
+      if (data[idx + 3] <= bgThreshold) {
+        w = 1;
+      } else if (bgLikelihood[ni] > 0.35) {
+        w = (bgLikelihood[ni] - 0.35) / 0.65;
+      }
+      if (w > 0) {
+        sr += originalData[idx] * w;
+        sg += originalData[idx + 1] * w;
+        sb += originalData[idx + 2] * w;
+        totalWeight += w;
+      }
+    }
+  }
+  if (totalWeight === 0) return null;
+  return [sr / totalWeight, sg / totalWeight, sb / totalWeight];
+}
+function restoreFringeColor(data, width, height, x, y, strength) {
+  const idx = (y * width + x) * 4;
+  const a = data[idx + 3];
+  if (a <= 10) return;
+  const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+  const greenness = g - Math.max(r, b);
+  if (greenness <= 3) return;
+  const radius = 3;
+  let sr = 0, sg = 0, sb = 0, n = 0;
+  let hasBgNeighbor = false;
+  for (let dy = -radius; dy <= radius; dy++) {
+    for (let dx = -radius; dx <= radius; dx++) {
+      if (dx === 0 && dy === 0) continue;
+      const px = Math.min(width - 1, Math.max(0, x + dx));
+      const py = Math.min(height - 1, Math.max(0, y + dy));
+      const nidx = (py * width + px) * 4;
+      if (data[nidx + 3] <= 30) hasBgNeighbor = true;
+      if (data[nidx + 3] >= 200) {
+        sr += data[nidx];
+        sg += data[nidx + 1];
+        sb += data[nidx + 2];
+        n++;
+      }
+    }
+  }
+  // 只在“贴背景”的边界上清绿，避免误伤内部实色
+  if (!hasBgNeighbor || n === 0) return;
+  const edgeFactor = a >= 245 ? 0.7 : (1 - Math.abs(a - 127.5) / 127.5);
+  const t = (strength / 100) * edgeFactor * Math.min(1, greenness / 22) * 0.9;
+  data[idx] = r * (1 - t) + (sr / n) * t;
+  data[idx + 1] = g * (1 - t) + (sg / n) * t;
+  data[idx + 2] = b * (1 - t) + (sb / n) * t;
+}
 self.onmessage = function(e) {
   const { imageData, params } = e.data;
   const { data, width, height } = imageData;
   const {
     keyColor, hueTolerance, greenThreshold, tolerance, feather,
     spillStrength, spillRange255, spillMode, edgeBlurRadius,
-    strokeProtectStrength, edgeFillStrength, strokeColor
+    strokeProtectStrength, edgeFillStrength, strokeColor,
+    localDespill, fringeCleanStrength
   } = params;
 
   const [tr, tg, tb] = parseHex(keyColor);
@@ -626,9 +754,11 @@ self.onmessage = function(e) {
   const [strokeR, strokeG, strokeB] = parseHex(strokeColor);
   const maxDist = Math.sqrt(255 * 255 * 3);
 
-  // 仅在需要描边保护时才拷贝原图数据
-  const originalData = strokeStr > 0 ? new Uint8ClampedArray(data) : null;
+  // 保留原图，用于局部背景估计、描边保护等参考
+  const originalData = new Uint8ClampedArray(data);
+  const bgLikelihood = new Float32Array(width * height);
 
+  // 1. 计算初始 alpha：综合色相、绿色浓度、与取样背景色的 RGB 距离
   for (let i = 0; i < data.length; i += 4) {
     let r = data[i];
     let g = data[i + 1];
@@ -637,41 +767,40 @@ self.onmessage = function(e) {
     const [h, s] = rgbToHsv(r, g, b);
     const greenness = Math.max(0, g - Math.max(r, b));
 
-    let hueMatch = 1;
-    if (s > 0.08) {
+    let hueScore = 0;
+    if (s > 0.05) {
       const dh = hueDiff(h, targetH);
-      if (dh <= hueTolerance) hueMatch = 0;
-      else hueMatch = (dh - hueTolerance) / (180 - hueTolerance);
+      if (dh <= hueTolerance) hueScore = 1 - dh / Math.max(1, hueTolerance);
     }
 
-    let greenMatch = 1;
+    let greenScore = 0;
     if (greenThreshold255 > 0) {
-      if (greenness >= greenThreshold255) greenMatch = 0;
-      else greenMatch = 1 - greenness / greenThreshold255;
+      greenScore = Math.min(1, greenness / greenThreshold255);
     }
 
-    let match = Math.max(hueMatch, greenMatch);
-    match = Math.max(0, Math.min(1, match));
+    const dr = r - tr, dg = g - tg, db = b - tb;
+    const rgbDist = Math.sqrt(dr * dr + dg * dg + db * db);
+    let proxScore = Math.max(0, 1 - rgbDist / (maxDist * 0.55));
 
-    // 根据容差和羽化计算 alpha，确保纯前景永远不透明
+    // 背景似然：任一指标强烈指向背景时即判为背景，但用 smoothstep 保留柔和边缘
+    let likelihood = Math.max(hueScore, greenScore * 0.95);
+    if (likelihood > 0.08) {
+      likelihood = Math.max(likelihood, proxScore * 0.5);
+    }
+    bgLikelihood[i / 4] = Math.min(1, likelihood);
+    let fgScore = 1 - Math.min(1, likelihood);
+
     const edgeEnd = Math.min(1, tol + fea);
     let a = 255;
-    if (match <= tol) {
+    if (fgScore <= tol) {
       a = 0;
-    } else if (fea > 0 && match < edgeEnd) {
-      a = 255 * (match - tol) / (edgeEnd - tol);
+    } else if (fea > 0 && fgScore < edgeEnd) {
+      a = 255 * smoothstep(tol, edgeEnd, fgScore);
     }
     a = Math.max(0, Math.min(255, a));
 
-    const isEdgePixel = a > 0 && a < 255;
-    if (spillMode === 'global') {
-      if (spillStr > 0 && g > Math.max(r, b)) {
-        [r, g, b] = despill(r, g, b, tr, tg, tb, spillRng255, spillStr, maxDist);
-      }
-    } else {
-      if (spillStr > 0 && isEdgePixel && g > Math.max(r, b)) {
-        [r, g, b] = despill(r, g, b, tr, tg, tb, spillRng255, spillStr, maxDist);
-      }
+    if (spillMode === 'global' && spillStr > 0 && g > Math.max(r, b)) {
+      [r, g, b] = despill(r, g, b, tr, tg, tb, spillRng255, spillStr, maxDist);
     }
 
     data[i] = r;
@@ -680,7 +809,40 @@ self.onmessage = function(e) {
     data[i + 3] = a;
   }
 
-  // 补充描边：只在“前景-背景”边界上的暗色边缘补回描边
+  // 2. 局部背景去绿：对边缘像素按附近真实背景色做更精确的去绿
+  // 现在不只处理半透明像素，对不透明但贴近背景的绿边像素也会修正
+  if (localDespill && spillStr > 0) {
+    const radius = 5;
+    const bgThreshold = 20;
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = (y * width + x) * 4;
+        const a = data[idx + 3];
+        if (a <= 5) continue;
+        const bg = estimateLocalBackground(data, originalData, bgLikelihood, width, height, x, y, radius, bgThreshold);
+        if (!bg) continue;
+        const [br, bgv, bb] = bg;
+        if (data[idx + 1] > Math.max(data[idx], data[idx + 2])) {
+          const [nr, ng, nb] = despill(data[idx], data[idx + 1], data[idx + 2], br, bgv, bb, spillRng255 * 1.1, spillStr, maxDist);
+          data[idx] = nr;
+          data[idx + 1] = ng;
+          data[idx + 2] = nb;
+        }
+      }
+    }
+  }
+
+  // 3. 边缘清绿：用附近实色前景替换半透明边缘残余绿色
+  if (fringeCleanStrength > 0) {
+    const strength = fringeCleanStrength;
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        restoreFringeColor(data, width, height, x, y, strength);
+      }
+    }
+  }
+
+  // 4. 补充描边：只在“前景-背景”边界上的暗色边缘补回描边
   if (strokeStr > 0) {
     const EDGE_THRESHOLD = 40;
     const FG_THRESHOLD = 128;
@@ -719,7 +881,7 @@ self.onmessage = function(e) {
     }
   }
 
-  // 对补充描边补回的像素再做一次去绿，防止出现绿色描边；同时尊重去绿模式
+  // 5. 对补充描边补回的像素再做一次去绿，防止出现绿色描边；同时尊重去绿模式
   if (spillStr > 0) {
     for (let i = 0; i < data.length; i += 4) {
       if (data[i + 3] > 0 && data[i + 1] > Math.max(data[i], data[i + 2])) {
@@ -772,6 +934,8 @@ self.onmessage = function(e) {
     const strokeProtectInput = document.getElementById('strokeProtect');
     const strokeColorInput = document.getElementById('strokeColor');
     const edgeFillInput = document.getElementById('edgeFill');
+    const localDespillInput = document.getElementById('localDespill');
+    const fringeCleanInput = document.getElementById('fringeClean');
     const hueToleranceVal = document.getElementById('hueToleranceVal');
     const greenThresholdVal = document.getElementById('greenThresholdVal');
     const toleranceVal = document.getElementById('toleranceVal');
@@ -781,6 +945,7 @@ self.onmessage = function(e) {
     const edgeBlurVal = document.getElementById('edgeBlurVal');
     const strokeProtectVal = document.getElementById('strokeProtectVal');
     const edgeFillVal = document.getElementById('edgeFillVal');
+    const fringeCleanVal = document.getElementById('fringeCleanVal');
     const cropXInput = document.getElementById('cropX');
     const cropYInput = document.getElementById('cropY');
     const cropWInput = document.getElementById('cropW');
@@ -848,7 +1013,9 @@ self.onmessage = function(e) {
         edgeBlurRadius: parseInt(edgeBlurInput.value, 10),
         strokeProtectStrength: parseFloat(strokeProtectInput.value),
         edgeFillStrength: parseFloat(edgeFillInput.value),
-        strokeColor: strokeColorInput.value
+        strokeColor: strokeColorInput.value,
+        localDespill: localDespillInput.checked,
+        fringeCleanStrength: parseFloat(fringeCleanInput.value)
       };
     }
 
@@ -1073,22 +1240,26 @@ self.onmessage = function(e) {
       keyColorInput.value = '#00ff00';
       hueToleranceInput.value = 35;
       greenThresholdInput.value = 30;
-      toleranceInput.value = 15;
-      featherInput.value = 12;
-      spillInput.value = 90;
-      spillRangeInput.value = 55;
+      toleranceInput.value = 14;
+      featherInput.value = 16;
+      spillInput.value = 70;
+      spillRangeInput.value = 45;
       edgeBlurInput.value = 0;
       strokeProtectInput.value = 0;
       edgeFillInput.value = 65;
+      localDespillInput.checked = true;
+      fringeCleanInput.value = 35;
+
       hueToleranceVal.textContent = 35;
       greenThresholdVal.textContent = 30;
-      toleranceVal.textContent = 15;
-      featherVal.textContent = 12;
-      spillVal.textContent = 90;
-      spillRangeVal.textContent = 55;
+      toleranceVal.textContent = 14;
+      featherVal.textContent = 16;
+      spillVal.textContent = 70;
+      spillRangeVal.textContent = 45;
       edgeBlurVal.textContent = 0;
       strokeProtectVal.textContent = 0;
       edgeFillVal.textContent = 65;
+      fringeCleanVal.textContent = 35;
       scheduleProcess();
     }
 
@@ -1227,6 +1398,11 @@ self.onmessage = function(e) {
     strokeColorInput.addEventListener('input', scheduleProcess);
     edgeFillInput.addEventListener('input', () => {
       edgeFillVal.textContent = edgeFillInput.value;
+      scheduleProcess();
+    });
+    localDespillInput.addEventListener('change', scheduleProcess);
+    fringeCleanInput.addEventListener('input', () => {
+      fringeCleanVal.textContent = fringeCleanInput.value;
       scheduleProcess();
     });
 
