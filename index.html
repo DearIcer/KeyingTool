@@ -412,7 +412,7 @@
         </div>
 
         <div class="control-group">
-          <label for="edgeBlur">边缘抗锯齿 <span class="tip-icon" data-tip="对 Alpha 通道做轻微高斯模糊，可减轻锯齿；过高会让边缘发虚" tabindex="0">?</span> <span id="edgeBlurVal" class="value">1</span></label>
+          <label for="edgeBlur">边缘抗锯齿 <span class="tip-icon" data-tip="仅对 Alpha 边缘做局部高斯模糊，平滑锯齿；模糊后自动再做一次局部去绿，避免产生绿边" tabindex="0">?</span> <span id="edgeBlurVal" class="value">1</span></label>
           <input type="range" id="edgeBlur" min="0" max="3" value="1" />
         </div>
 
@@ -533,6 +533,47 @@ function smoothstep(edge0, edge1, x) {
 function blurAlpha(data, width, height, radius) {
   if (radius <= 0) return;
   const len = width * height;
+  const EDGE_DIFF = 30;
+  const DILATE = 1;
+
+  // 1. 只找出 alpha 有变化的边缘像素，避免全图模糊
+  const edgeMap = new Uint8Array(len);
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const i = y * width + x;
+      const a = data[i * 4 + 3];
+      let isEdge = false;
+      for (let dy = -1; dy <= 1 && !isEdge; dy++) {
+        for (let dx = -1; dx <= 1 && !isEdge; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const ni = (y + dy) * width + (x + dx);
+          if (Math.abs(data[ni * 4 + 3] - a) > EDGE_DIFF) isEdge = true;
+        }
+      }
+      edgeMap[i] = isEdge ? 1 : 0;
+    }
+  }
+
+  // 2. 稍微膨胀边缘，让模糊能覆盖到边缘两侧
+  const affected = new Uint8Array(len);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      if (edgeMap[i]) {
+        affected[i] = 1;
+        continue;
+      }
+      for (let dy = -DILATE; dy <= DILATE && !affected[i]; dy++) {
+        for (let dx = -DILATE; dx <= DILATE && !affected[i]; dx++) {
+          const py = Math.min(height - 1, Math.max(0, y + dy));
+          const px = Math.min(width - 1, Math.max(0, x + dx));
+          if (edgeMap[py * width + px]) affected[i] = 1;
+        }
+      }
+    }
+  }
+
+  // 3. 只做可分离高斯模糊，且跳过非边缘像素
   const src = new Float32Array(len);
   for (let i = 0; i < len; i++) src[i] = data[i * 4 + 3];
   const temp = new Float32Array(len);
@@ -541,37 +582,45 @@ function blurAlpha(data, width, height, radius) {
   const sigma = Math.max(0.5, radius / 2);
   let sum = 0;
   for (let i = 0; i < size; i++) {
-    const x = i - radius;
-    const v = Math.exp(-(x * x) / (2 * sigma * sigma));
+    const xk = i - radius;
+    const v = Math.exp(-(xk * xk) / (2 * sigma * sigma));
     kernel[i] = v;
     sum += v;
   }
   for (let i = 0; i < size; i++) kernel[i] /= sum;
+
   for (let y = 0; y < height; y++) {
-    const rowStart = y * width;
     for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      if (!affected[i]) {
+        temp[i] = src[i];
+        continue;
+      }
       let s = 0;
       for (let k = -radius; k <= radius; k++) {
         const px = Math.min(width - 1, Math.max(0, x + k));
-        s += src[rowStart + px] * kernel[k + radius];
+        s += src[y * width + px] * kernel[k + radius];
       }
-      temp[rowStart + x] = s;
+      temp[i] = s;
     }
   }
-  for (let x = 0; x < width; x++) {
-    for (let y = 0; y < height; y++) {
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      if (!affected[i]) continue;
       let s = 0;
       for (let k = -radius; k <= radius; k++) {
         const py = Math.min(height - 1, Math.max(0, y + k));
         s += temp[py * width + x] * kernel[k + radius];
       }
-      src[y * width + x] = s;
+      src[i] = s;
     }
   }
   for (let i = 0; i < len; i++) {
     data[i * 4 + 3] = Math.max(0, Math.min(255, Math.round(src[i])));
   }
 }
+
 function fillEdgeColor(data, width, height, strength) {
   if (strength <= 0) return;
   const radius = 5;
@@ -632,13 +681,66 @@ function fillEdgeColor(data, width, height, strength) {
       // 越绿、越靠边缘，回填越积极；非绿边缘只轻微平滑
       let t = strength / 100;
       if (hasBgNeighbor) {
-        t *= 0.15 + 0.85 * Math.min(1, greenness / 30);
+        t *= 0.1 + 0.9 * Math.min(1, greenness / 20);
       }
       t = Math.max(0, Math.min(1, t));
 
       data[idx] = r * (1 - t) + (sr / totalWeight) * t;
       data[idx + 1] = g * (1 - t) + (sg / totalWeight) * t;
       data[idx + 2] = b * (1 - t) + (sb / totalWeight) * t;
+    }
+  }
+}
+function postBlurFix(data, originalData, bgLikelihood, width, height, spillRng255, spillStr, maxDist, fringeCleanStrength) {
+  // 边缘抗锯齿会把一些不透明边缘像素变成半透明，这些像素可能残留绿色
+  // 先局部去绿，再对仍带绿的像素用前景色回填
+  if (spillStr <= 0 && fringeCleanStrength <= 0) return;
+  const bgRadius = 4;
+  const bgThreshold = 30;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4;
+      const a = data[idx + 3];
+      if (a <= 10 || a >= 245) continue;
+      if (data[idx + 1] <= Math.max(data[idx], data[idx + 2]) + 3) continue;
+      const bg = estimateLocalBackground(data, originalData, bgLikelihood, width, height, x, y, bgRadius, bgThreshold);
+      if (!bg) continue;
+      const [br, bgv, bb] = bg;
+      if (spillStr > 0) {
+        const [nr, ng, nb] = despill(data[idx], data[idx + 1], data[idx + 2], br, bgv, bb, spillRng255, spillStr, maxDist);
+        data[idx] = nr; data[idx + 1] = ng; data[idx + 2] = nb;
+      }
+    }
+  }
+  if (fringeCleanStrength > 0) {
+    const fgRadius = 8;
+    const solidThreshold = 200;
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = (y * width + x) * 4;
+        const a = data[idx + 3];
+        if (a <= 10 || a >= 245) continue;
+        const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+        const greenness = g - Math.max(r, b);
+        if (greenness <= 5) continue;
+        let sr = 0, sg = 0, sb = 0, n = 0;
+        for (let dy = -fgRadius; dy <= fgRadius; dy++) {
+          for (let dx = -fgRadius; dx <= fgRadius; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const px = Math.min(width - 1, Math.max(0, x + dx));
+            const py = Math.min(height - 1, Math.max(0, y + dy));
+            const nidx = (py * width + px) * 4;
+            if (data[nidx + 3] >= solidThreshold) {
+              sr += data[nidx]; sg += data[nidx + 1]; sb += data[nidx + 2]; n++;
+            }
+          }
+        }
+        if (n === 0) continue;
+        const t = (fringeCleanStrength / 100) * Math.min(1, greenness / 25) * 0.9;
+        data[idx] = r * (1 - t) + (sr / n) * t;
+        data[idx + 1] = g * (1 - t) + (sg / n) * t;
+        data[idx + 2] = b * (1 - t) + (sb / n) * t;
+      }
     }
   }
 }
@@ -706,7 +808,7 @@ function restoreFringeColor(data, width, height, x, y, strength) {
   const r = data[idx], g = data[idx + 1], b = data[idx + 2];
   const greenness = g - Math.max(r, b);
   if (greenness <= 3) return;
-  const radius = 3;
+  const radius = 5;
   let sr = 0, sg = 0, sb = 0, n = 0;
   let hasBgNeighbor = false;
   for (let dy = -radius; dy <= radius; dy++) {
@@ -726,8 +828,8 @@ function restoreFringeColor(data, width, height, x, y, strength) {
   }
   // 只在“贴背景”的边界上清绿，避免误伤内部实色
   if (!hasBgNeighbor || n === 0) return;
-  const edgeFactor = a >= 245 ? 0.7 : (1 - Math.abs(a - 127.5) / 127.5);
-  const t = (strength / 100) * edgeFactor * Math.min(1, greenness / 22) * 0.9;
+  const edgeFactor = a >= 245 ? 0.85 : (1 - Math.abs(a - 127.5) / 127.5);
+  const t = (strength / 100) * edgeFactor * Math.min(1, greenness / 16);
   data[idx] = r * (1 - t) + (sr / n) * t;
   data[idx + 1] = g * (1 - t) + (sg / n) * t;
   data[idx + 2] = b * (1 - t) + (sb / n) * t;
@@ -899,6 +1001,8 @@ self.onmessage = function(e) {
   }
   if (edgeBlurRadius > 0) {
     blurAlpha(data, width, height, edgeBlurRadius);
+    // 抗锯齿会产生新的半透明边缘，做一次轻量去绿/回填防止绿边
+    postBlurFix(data, originalData, bgLikelihood, width, height, spillRng255, spillStr, maxDist, fringeCleanStrength);
   }
 
   self.postMessage({ imageData }, [imageData.data.buffer]);
